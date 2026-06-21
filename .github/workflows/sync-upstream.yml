@@ -65,11 +65,24 @@ jobs:
           }
           git push origin "${TARGET_BRANCH}"
 
-      - name: Push upstream tags
+      - name: Create missing upstream tags
         shell: bash
         run: |
           set -euo pipefail
-          git push origin --tags
+          git ls-remote --tags upstream | awk '{print $2}' | sed 's#^refs/tags/##' | sed 's/\^\{\}$//' | sort -u | while read -r tag; do
+            [ -n "${tag}" ] || continue
+
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+              continue
+            fi
+
+            sha="$(git rev-parse "${tag}^{}")"
+            gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${tag}" \
+              -f sha="${sha}"
+          done
 
       - name: Mirror upstream releases
         if: ${{ env.SYNC_RELEASES == 'true' }}
