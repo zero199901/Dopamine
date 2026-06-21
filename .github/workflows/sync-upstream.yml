@@ -72,16 +72,11 @@ jobs:
           git ls-remote --tags upstream | awk '{print $2}' | sed 's#^refs/tags/##' | sed 's/\^\{\}$//' | sort -u | while read -r tag; do
             [ -n "${tag}" ] || continue
 
-            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" >/dev/null 2>&1; then
               continue
             fi
 
-            sha="$(git rev-parse "${tag}^{}")"
-            gh api \
-              --method POST \
-              "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${tag}" \
-              -f sha="${sha}"
+            git push origin "refs/tags/${tag}:refs/tags/${tag}"
           done
 
       - name: Mirror upstream releases
