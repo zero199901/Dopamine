@@ -65,70 +65,113 @@ jobs:
           }
           git push origin "${TARGET_BRANCH}"
 
-      - name: Create missing upstream tags
+      - name: Sync upstream tags
         shell: bash
         run: |
           set -euo pipefail
           git ls-remote --tags upstream | awk '{print $2}' | sed 's#^refs/tags/##' | sed 's/\^{}$//' | sort -u | while read -r tag; do
             [ -n "${tag}" ] || continue
-
-            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" >/dev/null 2>&1; then
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
               continue
             fi
-
             git push origin "refs/tags/${tag}:refs/tags/${tag}"
           done
 
       - name: Mirror upstream releases
         if: ${{ env.SYNC_RELEASES == 'true' }}
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          workdir="$(mktemp -d)"
-          releases_json="${workdir}/releases.json"
+          $ErrorActionPreference = 'Stop'
 
-          gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" > "${releases_json}"
-          jq -c '.[]' "${releases_json}" | while read -r release; do
-            tag="$(jq -r '.tag_name' <<< "${release}")"
-            name="$(jq -r '.name // .tag_name' <<< "${release}")"
-            body_file="${workdir}/${tag}.md"
-            jq -r '.body // ""' <<< "${release}" > "${body_file}"
-            prerelease="$(jq -r '.prerelease' <<< "${release}")"
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent' = 'github-actions-release-sync'
+          }
 
-            if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" >/dev/null 2>&1; then
-              gh release edit "${tag}" \
-                --repo "${GITHUB_REPOSITORY}" \
-                --title "${name}" \
-                --notes-file "${body_file}" \
-                $([ "${prerelease}" = "true" ] && echo "--prerelease" || echo "")
-            else
-              gh release create "${tag}" \
-                --repo "${GITHUB_REPOSITORY}" \
-                --title "${name}" \
-                --notes-file "${body_file}" \
-                --target "${tag}" \
-                $([ "${prerelease}" = "true" ] && echo "--prerelease" || echo "")
-            fi
+          function Download-WithRetry {
+            param(
+              [string]$Url,
+              [string]$OutFile,
+              [hashtable]$Headers,
+              [int]$MaxAttempts = 4
+            )
 
-            assets_len="$(jq '.assets | length' <<< "${release}")"
-            if [ "${assets_len}" -eq 0 ]; then
-              continue
-            fi
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                Invoke-WebRequest -Headers $Headers -Uri $Url -OutFile $OutFile
+                return
+              } catch {
+                if ($attempt -eq $MaxAttempts) { throw }
+                Start-Sleep -Seconds (5 * $attempt)
+              }
+            }
+          }
 
-            asset_dir="${workdir}/${tag}"
-            mkdir -p "${asset_dir}"
+          $tmpRoot = Join-Path $env:RUNNER_TEMP ('release-sync-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Force -Path $tmpRoot | Out-Null
 
-            jq -c '.assets[]' <<< "${release}" | while read -r asset; do
-              asset_id="$(jq -r '.id' <<< "${asset}")"
-              asset_name="$(jq -r '.name' <<< "${asset}")"
-              asset_path="${asset_dir}/${asset_name}"
+          try {
+            $srcRepo = $env:UPSTREAM_REPO
+            $dstRepo = $env:GITHUB_REPOSITORY
 
-              gh api \
-                -H "Accept: application/octet-stream" \
-                "repos/${UPSTREAM_REPO}/releases/assets/${asset_id}" > "${asset_path}"
+            $srcReleases = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$srcRepo/releases?per_page=100" -Method Get
+            $dstReleases = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$dstRepo/releases?per_page=100" -Method Get
 
-              gh release upload "${tag}" "${asset_path}" \
-                --repo "${GITHUB_REPOSITORY}" \
-                --clobber
-            done
-          done
+            $existingTags = @{}
+            foreach ($release in $dstReleases) {
+              $existingTags[$release.tag_name] = $true
+            }
+
+            foreach ($release in $srcReleases) {
+              $tag = $release.tag_name
+              $name = if ($null -ne $release.name -and $release.name -ne '') { $release.name } else { $tag }
+
+              if ($existingTags.ContainsKey($tag)) {
+                $targetRelease = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$dstRepo/releases/tags/$tag" -Method Get
+              } else {
+                $payload = @{
+                  tag_name = $tag
+                  name = $name
+                  body = if ($null -ne $release.body) { [string]$release.body } else { '' }
+                  draft = [bool]$release.draft
+                  prerelease = [bool]$release.prerelease
+                  generate_release_notes = $false
+                } | ConvertTo-Json -Depth 10
+
+                $targetRelease = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$dstRepo/releases" -Method Post -Body $payload -ContentType 'application/json'
+                $existingTags[$tag] = $true
+              }
+
+              if (-not $release.assets -or $release.assets.Count -eq 0) {
+                continue
+              }
+
+              $targetAssets = @{}
+              foreach ($asset in $targetRelease.assets) {
+                $targetAssets[$asset.name] = $true
+              }
+
+              $assetDir = Join-Path $tmpRoot $tag
+              New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+
+              foreach ($asset in $release.assets) {
+                if ($targetAssets.ContainsKey($asset.name)) {
+                  continue
+                }
+
+                $assetPath = Join-Path $assetDir $asset.name
+                Download-WithRetry -Url $asset.browser_download_url -OutFile $assetPath -Headers $headers
+
+                $uploadUrl = $targetRelease.upload_url -replace '\{\?name,label\}', ('?name=' + [uri]::EscapeDataString($asset.name))
+                Invoke-RestMethod -Headers $headers -Uri $uploadUrl -Method Post -InFile $assetPath -ContentType 'application/octet-stream' | Out-Null
+
+                Remove-Item -LiteralPath $assetPath -Force
+              }
+            }
+          } finally {
+            if (Test-Path $tmpRoot) {
+              Remove-Item -LiteralPath $tmpRoot -Recurse -Force
+            }
+          }
