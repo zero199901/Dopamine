@@ -1,0 +1,121 @@
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Upstream repo in owner/name format
+        required: true
+        default: w2599/Dopamine
+      sync_releases:
+        description: Mirror upstream releases and assets
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: ${{ inputs.upstream_repo || 'w2599/Dopamine' }}
+      SYNC_RELEASES: ${{ inputs.sync_releases != false }}
+      TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve upstream default branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_branch="$(gh api "repos/${UPSTREAM_REPO}" --jq '.default_branch')"
+          echo "UPSTREAM_BRANCH=${upstream_branch}" >> "$GITHUB_ENV"
+          echo "Resolved upstream branch: ${upstream_branch}"
+
+      - name: Merge upstream branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}" --tags --force
+          git checkout "${TARGET_BRANCH}"
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}" || {
+            echo "Automatic merge failed. Manual conflict resolution required."
+            exit 1
+          }
+          git push origin "${TARGET_BRANCH}"
+
+      - name: Push upstream tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin --tags
+
+      - name: Mirror upstream releases
+        if: ${{ env.SYNC_RELEASES == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          releases_json="${workdir}/releases.json"
+
+          gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" > "${releases_json}"
+          jq -c '.[]' "${releases_json}" | while read -r release; do
+            tag="$(jq -r '.tag_name' <<< "${release}")"
+            name="$(jq -r '.name // .tag_name' <<< "${release}")"
+            body_file="${workdir}/${tag}.md"
+            jq -r '.body // ""' <<< "${release}" > "${body_file}"
+            prerelease="$(jq -r '.prerelease' <<< "${release}")"
+
+            if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" >/dev/null 2>&1; then
+              gh release edit "${tag}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --title "${name}" \
+                --notes-file "${body_file}" \
+                $([ "${prerelease}" = "true" ] && echo "--prerelease" || echo "")
+            else
+              gh release create "${tag}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --title "${name}" \
+                --notes-file "${body_file}" \
+                --target "${tag}" \
+                $([ "${prerelease}" = "true" ] && echo "--prerelease" || echo "")
+            fi
+
+            assets_len="$(jq '.assets | length' <<< "${release}")"
+            if [ "${assets_len}" -eq 0 ]; then
+              continue
+            fi
+
+            asset_dir="${workdir}/${tag}"
+            mkdir -p "${asset_dir}"
+
+            jq -c '.assets[]' <<< "${release}" | while read -r asset; do
+              asset_id="$(jq -r '.id' <<< "${asset}")"
+              asset_name="$(jq -r '.name' <<< "${asset}")"
+              asset_path="${asset_dir}/${asset_name}"
+
+              gh api \
+                -H "Accept: application/octet-stream" \
+                "repos/${UPSTREAM_REPO}/releases/assets/${asset_id}" > "${asset_path}"
+
+              gh release upload "${tag}" "${asset_path}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --clobber
+            done
+          done
