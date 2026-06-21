@@ -69,7 +69,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git ls-remote --tags upstream | awk '{print $2}' | sed 's#^refs/tags/##' | sed 's/\^\{\}$//' | sort -u | while read -r tag; do
+          git ls-remote --tags upstream | awk '{print $2}' | sed 's#^refs/tags/##' | sed 's/\^{}$//' | sort -u | while read -r tag; do
             [ -n "${tag}" ] || continue
 
             if git ls-remote --exit-code --tags origin "refs/tags/${tag}" "refs/tags/${tag}^{}" >/dev/null 2>&1; then
