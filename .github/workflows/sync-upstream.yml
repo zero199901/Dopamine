@@ -1,11 +1,6 @@
 name: Sync upstream
 
 on:
-  push:
-    branches:
-      - 2.x_modify
-    paths:
-      - .github/workflows/sync-upstream.yml
   workflow_dispatch:
     inputs:
       upstream_repo:
